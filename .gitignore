@@ -1,0 +1,13 @@
+# PlatformIO build output
+.pio/
+
+# Keil build output and local IDE state
+/stm32-foc/software/MDK-ARM/C6T6SimpleFoc/
+*.lst
+*.uvguix.*
+*.build_log.htm
+*.log
+
+# Operating system files
+Thumbs.db
+.DS_Store
