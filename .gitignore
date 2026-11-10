@@ -1,5 +1,6 @@
 # PlatformIO build output
 .pio/
+/.vscode/
 
 # Keil build output and local IDE state
 /stm32-foc/software/MDK-ARM/C6T6SimpleFoc/

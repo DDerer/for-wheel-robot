@@ -6,8 +6,8 @@
 #include <Arduino.h>
 #include <PID.h>
 #include "driver/twai.h"
-#include "I2Cdev.h"
-#include "MPU6050_6Axis_MotionApps20.h"
+#include "board_config.h"
+#include "jy901s.h"
 #include "leg_pos.h"
 #include "lqr_k.h"
 #include "leg_conv.h"
@@ -18,6 +18,8 @@
 #include <esp_task_wdt.h>
 #include <string.h>
 #include <debug.h>
+
+static_assert(configTICK_RATE_HZ == 1000, "The legacy controller requires 1 ms RTOS ticks");
 
 /*******************宏定义*******************/
 
@@ -36,7 +38,7 @@ uint32_t timeCnt[6] = {0}, lastTimeCnt[6] = {0}, passTimeCnt[6] = {0};
 /*******************结构体类型和全局变量定义*******************/
 
 //IMU对象及数据
-MPU6050 mpu;
+Jy901s imu;
 struct IMUData
 {
 	float yaw, pitch, roll;			 // rad
@@ -108,14 +110,37 @@ BLEServer *server;
 BLEService *service;
 
 float motorOutRatio = 1.0f; //电机输出电压比例，对所有电机同时有效
-float sourceVoltage = 12; //当前电源电压
+float sourceVoltage = BoardConfig::kNominalVoltage; //当前电源电压
+
+portMUX_TYPE motorMux = portMUX_INITIALIZER_UNLOCKED;
+Motor *motorList[] = {&leftJoint[0], &leftJoint[1], &leftWheel,
+                      &rightJoint[0], &rightJoint[1], &rightWheel};
+uint32_t motorReceivedAt[6] = {};
+bool motorReceived[6] = {};
+volatile bool motorsArmed = false;
+volatile bool canReady = false;
+volatile bool controlReady = false;
+volatile bool standupRequested = false;
+volatile bool stopRequested = false;
+TaskHandle_t standupTask = nullptr;
+uint32_t canRxFrames = 0, canTxErrors = 0;
+QueueHandle_t commandQueue;
+struct MotionCommand { float speed, yawSpeed, legLength; };
+QueueHandle_t motionQueue;
+
+enum class UserCommand { Arm, Stop, Standup, Heading, ConfigureImu };
+void Control_Stop();
+bool Control_Arm();
+bool Control_FeedbackReady();
+void Print_Status();
+void Handle_Command(UserCommand command);
 
 /*******************函数声明*******************/
 
 void setup();
 void loop();
 
-void Motor_Init(Motor *motor, float offsetAngle, float maxVoltage, float torqueRatio, float dir);
+void Motor_Init(Motor *motor, float offsetAngle, float maxVoltage, float torqueRatio, float dir, float (*calcRevVolt)(float speed));
 float Motor_CalcRevVolt4010(float speed);
 float Motor_CalcRevVolt2804(float speed);
 void Motor_InitAll();
@@ -154,7 +179,7 @@ void ADC_Init();
 //初始化一个电机对象
 void Motor_Init(Motor *motor, float offsetAngle, float maxVoltage, float torqueRatio, float dir, float (*calcRevVolt)(float speed))
 {
-	motor->speed = motor->angle = motor->voltage = 0;
+	motor->speed = motor->angle = motor->voltage = motor->torque = 0;
 	motor->offsetAngle = offsetAngle;
 	motor->maxVoltage = maxVoltage;
 	motor->torqueRatio = torqueRatio;
@@ -186,20 +211,26 @@ void Motor_InitAll()
 	Motor_Init(&rightJoint[0], 0.343, 7, 0.0299f, -1, Motor_CalcRevVolt4010);
 	Motor_Init(&rightJoint[1], -2.446, 7, 0.0321f, -1, Motor_CalcRevVolt4010);
 	Motor_Init(&rightWheel, 0, 4.0f, 0.0101f, 1, Motor_CalcRevVolt2804);
-	xTaskCreate(Motor_SendTask, "Motor_SendTask", 2048, NULL, 5, NULL);
+	// Sending starts after control initialization in setup().
 }
 
 //从CAN总线接收到的数据中解析出电机角度和速度
 void Motor_Update(Motor *motor, uint8_t *data)
 {
-	motor->angle = (*(int32_t *)&data[0] / 1000.0f - motor->offsetAngle) * motor->dir;
-	motor->speed = (*(int16_t *)&data[4] / 10 * 2 * M_PI / 60) * motor->dir;
+    int32_t angle;
+    int16_t speed;
+    memcpy(&angle, data, sizeof(angle));
+    memcpy(&speed, data + 4, sizeof(speed));
+    motor->angle = (angle / 1000.0f - motor->offsetAngle) * motor->dir;
+    motor->speed = speed / 10.0f * 2.0f * M_PI / 60.0f * motor->dir;
 }
 
 //设置电机扭矩
 void Motor_SetTorque(Motor *motor, float torque)
 {
-	motor->torque = torque;
+	portENTER_CRITICAL(&motorMux);
+    motor->torque = isfinite(torque) ? torque : 0.0f;
+    portEXIT_CRITICAL(&motorMux);
 }
 
 //由设置的目标扭矩和当前转速计算补偿反电动势后的驱动输出电压，并进行限幅
@@ -221,23 +252,35 @@ void Motor_UpdateVoltage(Motor *motor)
 //电机指令发送任务
 void Motor_SendTask(void *arg)
 {
-	uint8_t data[8] = {0};
-	Motor* motorList[] = {&leftJoint[0], &leftJoint[1], &leftWheel, &rightJoint[0], &rightJoint[1], &rightWheel};
-	while (1)
-	{
-		for (int i = 0; i < 6; i++)
-			Motor_UpdateVoltage(motorList[i]); //计算补偿后的电机电压
-		
-		*(int16_t *)&data[0] = ((int16_t)(leftJoint[0].voltage * 1000));
-		*(int16_t *)&data[2] = ((int16_t)(leftJoint[1].voltage * 1000));
-		*(int16_t *)&data[4] = ((int16_t)(leftWheel.voltage * 1000));
-		CAN_SendFrame(0x100, data);
-		*(int16_t *)&data[0] = ((int16_t)(rightJoint[0].voltage * 1000));
-		*(int16_t *)&data[2] = ((int16_t)(rightJoint[1].voltage * 1000));
-		*(int16_t *)&data[4] = ((int16_t)(rightWheel.voltage * 1000));
-		CAN_SendFrame(0x200, data);
-		vTaskDelay(2);
-	}
+    TickType_t wake = xTaskGetTickCount();
+    while (true) {
+        if (stopRequested) {
+            stopRequested = false;
+            Control_Stop();
+        }
+        if (motorsArmed && !Control_FeedbackReady()) {
+            Control_Stop();
+            Serial.println("DISARMED: IMU/CAN feedback unavailable or too slow");
+        }
+        uint8_t groups[2][8] = {};
+        portENTER_CRITICAL(&motorMux);
+        const bool enabled = motorsArmed && controlReady;
+        for (size_t i = 0; i < 6; i++) {
+            Motor *motor = motorList[i];
+            motor->voltage = 0;
+            if (enabled) Motor_UpdateVoltage(motor);
+            if (!isfinite(motor->voltage)) motor->voltage = 0;
+            const int16_t millivolts = static_cast<int16_t>(motor->voltage * 1000.0f);
+            const uint8_t slot = BoardConfig::kMotorIds[i] - 1;
+            memcpy(&groups[slot / 4][(slot % 4) * 2], &millivolts, sizeof(millivolts));
+        }
+        portEXIT_CRITICAL(&motorMux);
+        if (canReady) {
+            CAN_SendFrame(0x100, groups[0]);
+            CAN_SendFrame(0x200, groups[1]);
+        }
+        vTaskDelayUntil(&wake, pdMS_TO_TICKS(2));
+    }
 }
 
 /******* CAN通信模块 *******/
@@ -245,73 +288,62 @@ void Motor_SendTask(void *arg)
 //CAN收到数据后进入的回调函数
 void CAN_RecvCallback(uint32_t id, uint8_t *data)
 {
-	switch (id) //根据CAN ID更新各电机数据
-	{
-	case 0x101:
-		Motor_Update(&leftJoint[0], data);
-		break;
-	case 0x102:
-		Motor_Update(&leftJoint[1], data);
-		break;
-	case 0x103:
-		Motor_Update(&leftWheel, data);
-		break;
-	case 0x105:
-		Motor_Update(&rightJoint[0], data);
-		break;
-	case 0x106:
-		Motor_Update(&rightJoint[1], data);
-		break;
-	case 0x107:
-		Motor_Update(&rightWheel, data);
-		break;
-	}
+    for (size_t i = 0; i < 6; i++) {
+        if (id == 0x100u + BoardConfig::kMotorIds[i]) {
+            portENTER_CRITICAL(&motorMux);
+            Motor_Update(motorList[i], data);
+            motorReceivedAt[i] = millis();
+            motorReceived[i] = true;
+            canRxFrames++;
+            portEXIT_CRITICAL(&motorMux);
+            return;
+        }
+    }
 }
 
 //CAN数据帧轮询接收任务
 void CAN_RecvTask(void *arg)
 {
-	twai_message_t msg;
-	twai_status_info_t status;
-	
-	TickType_t xLastWakeTime = xTaskGetTickCount();
-	while (1)
-	{
-		twai_get_status_info(&status);
-		for(uint8_t i = 0; i < status.msgs_to_rx; i++)
-		{
-			if(twai_receive(&msg, 0) == ESP_OK)
-				CAN_RecvCallback(msg.identifier, msg.data);
-		}
-		vTaskDelayUntil(&xLastWakeTime, 2); //2ms轮询一次
-	}
+    twai_message_t msg;
+    while (true) {
+        if (twai_receive(&msg, pdMS_TO_TICKS(10)) == ESP_OK &&
+            !msg.extd && !msg.rtr && msg.data_length_code == 8) {
+            CAN_RecvCallback(msg.identifier, msg.data);
+        }
+        twai_status_info_t status;
+        if (twai_get_status_info(&status) != ESP_OK) continue;
+        if (status.state == TWAI_STATE_BUS_OFF) {
+            Control_Stop();
+            twai_initiate_recovery();
+        } else if (status.state == TWAI_STATE_STOPPED) {
+            twai_start();
+        }
+    }
 }
 
 //CAN通信外设初始化
 void CAN_Init()
 {
-	twai_general_config_t twai_conf = {
-		.mode = TWAI_MODE_NORMAL,
-		.tx_io = GPIO_NUM_6,
-		.rx_io = GPIO_NUM_7,
-		.clkout_io = TWAI_IO_UNUSED,
-		.bus_off_io = TWAI_IO_UNUSED,
-		.tx_queue_len = 5,
-		.rx_queue_len = 10,
-		.alerts_enabled = TWAI_ALERT_NONE,
-		.clkout_divider = 0,
-		.intr_flags = ESP_INTR_FLAG_LEVEL1};
-
-	twai_timing_config_t twai_timing = TWAI_TIMING_CONFIG_1MBITS();
-
-	twai_filter_config_t twai_filter = {
-		.acceptance_code = 0x00000000,
-		.acceptance_mask = 0xFFFFFFFF,
-		.single_filter = true};
-
-	twai_driver_install(&twai_conf, &twai_timing, &twai_filter);
-	twai_start();
-	xTaskCreate(CAN_RecvTask, "CAN_RecvTask", 2048, NULL, 5, NULL);
+    twai_general_config_t general = TWAI_GENERAL_CONFIG_DEFAULT(
+        static_cast<gpio_num_t>(BoardConfig::kCanTx),
+        static_cast<gpio_num_t>(BoardConfig::kCanRx), TWAI_MODE_NORMAL);
+    general.tx_queue_len = 2;
+    general.rx_queue_len = 64;
+    twai_timing_config_t timing = TWAI_TIMING_CONFIG_1MBITS();
+    twai_filter_config_t filter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    esp_err_t result = twai_driver_install(&general, &timing, &filter);
+    if (result != ESP_OK) {
+        Serial.printf("CAN install failed: %s\n", esp_err_to_name(result));
+        return;
+    }
+    result = twai_start();
+    if (result != ESP_OK) {
+        twai_driver_uninstall();
+        Serial.printf("CAN start failed: %s\n", esp_err_to_name(result));
+        return;
+    }
+    canReady = true;
+    xTaskCreatePinnedToCore(CAN_RecvTask, "CAN_RecvTask", 3072, nullptr, 5, nullptr, 1);
 }
 
 //发送一帧CAN数据(data为8字节数据)
@@ -322,7 +354,9 @@ void CAN_SendFrame(uint32_t id, uint8_t *data)
 	msg.identifier = id;
 	msg.data_length_code = 8;
 	memcpy(msg.data, data, 8);
-	twai_transmit(&msg, 100);
+	// Single shot bounds queued commands when no node acknowledges the bus.
+    msg.ss = 1;
+    if (twai_transmit(&msg, 0) != ESP_OK) canTxErrors++;
 }
 
 /******* 陀螺仪模块 *******/
@@ -330,78 +364,16 @@ void CAN_SendFrame(uint32_t id, uint8_t *data)
 //陀螺仪数据获取任务
 void IMU_Task(void *arg)
 {
-	TickType_t xLastWakeTime = xTaskGetTickCount();
-
-	uint8_t fifoBuffer[64]; //dmp数据接收区
-	int16_t yawRound = 0; //统计yaw转过的整圈数
-	float lastYaw = 0;
-	
-	while (1)
-	{
-		if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer))
-		{
-			//获取陀螺仪角速度
-			int16_t gyroData[3];
-			mpu.getRotation(&gyroData[0], &gyroData[1], &gyroData[2]);
-			imuData.rollSpd = gyroData[1] / 16.4f * M_PI / 180.0f;
-			imuData.pitchSpd = -gyroData[0] / 16.4f * M_PI / 180.0f;
-			imuData.yawSpd = gyroData[2] / 16.4f * M_PI / 180.0f;
-			
-			//获取陀螺仪欧拉角
-			float ypr[3];
-			Quaternion q;
-			VectorFloat gravity;
-			mpu.dmpGetQuaternion(&q, fifoBuffer);
-			mpu.dmpGetGravity(&gravity, &q);
-			mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-			float yaw = -ypr[0];
-			imuData.pitch = -ypr[2];
-			imuData.roll = -ypr[1];
-
-			if (yaw - lastYaw > M_PI)
-				yawRound--;
-			else if (yaw - lastYaw < -M_PI)
-				yawRound++;
-			lastYaw = yaw;
-			imuData.yaw = yaw + yawRound * 2 * M_PI; //imuData.yaw为累计转角
-
-			//获取陀螺仪Z轴加速度
-			VectorInt16 rawAccel;
-			mpu.dmpGetAccel(&rawAccel, fifoBuffer);
-			VectorInt16 accel;
-			mpu.dmpGetLinearAccel(&accel, &rawAccel, &gravity);
-			imuData.zAccel = accel.z / 8192.0f * 9.8f;
-		}
-		vTaskDelayUntil(&xLastWakeTime, 5); //5ms轮询一次
-	}
+    while (true) {
+        imu.poll();
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
 }
 
-//陀螺仪模块初始化
 void IMU_Init()
 {
-	//初始化IIC
-	Wire.begin(5, 4);
-	Wire.setClock(400000);
-
-	//初始化陀螺仪
-	mpu.initialize();
-	Serial.println(mpu.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
-	Serial.println("Address: 0x" + String(mpu.getDeviceID(), HEX));
-	mpu.setFullScaleAccelRange(MPU6050_IMU::MPU6050_ACCEL_FS_16);
-	while(mpu.dmpInitialize() != 0);
-	mpu.setXAccelOffset(-668);
-	mpu.setYAccelOffset(-1632);
-	mpu.setZAccelOffset(998);
-	mpu.setXGyroOffset(283);
-	mpu.setYGyroOffset(80);
-	mpu.setZGyroOffset(42);
-	// mpu.CalibrateAccel(6); //测量偏移数据
-	// mpu.CalibrateGyro(6);
-	// mpu.PrintActiveOffsets();
-	mpu.setDMPEnabled(true);
-
-	//开启陀螺仪数据获取任务
-	xTaskCreate(IMU_Task, "IMU_Task", 2048, NULL, 5, NULL);
+    imu.begin(BoardConfig::kImuRx, BoardConfig::kImuTx);
+    xTaskCreatePinnedToCore(IMU_Task, "IMU_Task", 4096, nullptr, 5, nullptr, 1);
 }
 
 /******* 运动控制模块 *******/
@@ -414,6 +386,16 @@ void Ctrl_TargetUpdateTask(void *arg)
 	while (1)
 	{
 		//根据当前腿长计算速度斜坡步长(腿越短越稳定，加减速斜率越大)
+		if (!motorsArmed) {
+			vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(4));
+			continue;
+		}
+        MotionCommand command;
+        if (xQueueReceive(motionQueue, &command, 0) == pdTRUE) {
+            target.speedCmd = command.speed;
+            target.yawSpeedCmd = command.yawSpeed;
+            target.legLength = command.legLength;
+        }
 		float legLength = (leftLegPos.length + rightLegPos.length) / 2;
 		speedSlopeStep = -(legLength - 0.07f) * 0.02f + 0.002f;
 
@@ -498,17 +480,35 @@ void Ctrl_StandupPrepareTask(void *arg)
 	//将左腿向后摆
 	Motor_SetTorque(&leftJoint[0], 0.2f);
 	Motor_SetTorque(&leftJoint[1], 0.2f);
-	while(leftLegPos.angle < M_3PI_4)
-		vTaskDelay(5);
+    const uint32_t leftStartedAt = millis();
+    while (leftLegPos.angle < M_3PI_4) {
+        if (!motorsArmed || millis() - leftStartedAt > BoardConfig::kStandupTimeoutMs) {
+            Control_Stop();
+            standupTask = nullptr;
+            vTaskDelete(nullptr);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
 	Motor_SetTorque(&leftJoint[0], 0);
 	Motor_SetTorque(&leftJoint[1], 0);
 	vTaskDelay(1000);
 
+    if (!motorsArmed) {
+        standupTask = nullptr;
+        vTaskDelete(nullptr);
+    }
 	//将右腿向前摆
 	Motor_SetTorque(&rightJoint[0], -0.2f);
 	Motor_SetTorque(&rightJoint[1], -0.2f);
-	while(rightLegPos.angle > M_PI_4)
-		vTaskDelay(5);
+    const uint32_t rightStartedAt = millis();
+    while (rightLegPos.angle > M_PI_4) {
+        if (!motorsArmed || millis() - rightStartedAt > BoardConfig::kStandupTimeoutMs) {
+            Control_Stop();
+            standupTask = nullptr;
+            vTaskDelete(nullptr);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
 	Motor_SetTorque(&rightJoint[0], 0);
 	Motor_SetTorque(&rightJoint[1], 0);
 	vTaskDelay(1000);
@@ -521,7 +521,8 @@ void Ctrl_StandupPrepareTask(void *arg)
 	Motor_SetTorque(&rightJoint[1], 0);
 	Motor_SetTorque(&rightWheel, 0);
 	
-	standupState = StandupState_Standup;
+    if (motorsArmed) standupState = StandupState_Standup;
+    standupTask = nullptr;
 
 	vTaskDelete(NULL);
 }
@@ -547,6 +548,20 @@ void Ctrl_Task(void *arg)
 
 	while (1)
 	{
+        const Jy901sSample sample = imu.snapshot();
+        imuData = {sample.yaw, sample.pitch, sample.roll,
+                   sample.yawSpeed, sample.pitchSpeed, sample.rollSpeed, sample.zAcceleration};
+        if (!motorsArmed || !Control_FeedbackReady()) {
+            controlReady = false;
+            vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(4));
+            continue;
+        }
+		if (!isfinite(leftLegPos.length) || !isfinite(rightLegPos.length) ||
+            leftLegPos.length < 0.04f || rightLegPos.length < 0.04f ||
+            leftLegPos.length > 0.15f || rightLegPos.length > 0.15f) {
+            Control_Stop();
+            continue;
+        }
 		//计算状态变量
 		stateVar.phi = imuData.pitch;
 		stateVar.dPhi = imuData.pitchSpd;
@@ -557,9 +572,18 @@ void Ctrl_Task(void *arg)
 		float legLength = (leftLegPos.length + rightLegPos.length) / 2;
 		float dLegLength = (leftLegPos.dLength + rightLegPos.dLength) / 2;
 
+        if (standupRequested) {
+            standupRequested = false;
+            standupState = StandupState_Prepare;
+            if (xTaskCreatePinnedToCore(Ctrl_StandupPrepareTask, "StandupPrepare_Task", 4096,
+                                       nullptr, 1, &standupTask, 1) != pdPASS) {
+                Control_Stop();
+            }
+        }
 		//如果正在站立准备状态，则不进行后续控制
 		if(standupState == StandupState_Prepare)
 		{
+            controlReady = true;
 			vTaskDelayUntil(&xLastWakeTime, 4);
 			continue;
 		}
@@ -656,45 +680,28 @@ void Ctrl_Task(void *arg)
 		#define PROTECT_CONDITION (leftTheta < -M_PI_4 || leftTheta > M_PI_4 || \
 								   rightTheta < -M_PI_4 || rightTheta > M_PI_4 || \
 								   imuData.pitch > M_PI_4 || imuData.pitch < -M_PI_4) //腿部角度超限保护条件
-		if(PROTECT_CONDITION) //当前达到保护条件
-		{
-			if(standupState == StandupState_None) //未处于起立过程中
-			{
-				//关闭所有电机
-				Motor_SetTorque(&leftWheel, 0);
-				Motor_SetTorque(&rightWheel, 0);
-				Motor_SetTorque(&leftJoint[0], 0);
-				Motor_SetTorque(&leftJoint[1], 0);
-				Motor_SetTorque(&rightJoint[0], 0);
-				Motor_SetTorque(&rightJoint[1], 0);
-				//阻塞等待腿部角度回到安全范围，再等待4s后恢复控制(若中途触发了起立则在起立准备完成后直接跳出)
-				while(PROTECT_CONDITION && standupState == StandupState_None)
-				{
-					leftTheta = leftLegPos.angle - imuData.pitch - M_PI_2;
-					rightTheta = rightLegPos.angle - imuData.pitch - M_PI_2;
-					vTaskDelay(100);
-				}
-				if(standupState == StandupState_None)
-					vTaskDelay(4000);
-				//退出保护后设定目标位置和yaw角度为当前值
-				target.position = (leftWheel.angle + rightWheel.angle) / 2 * wheelRadius;
-				target.yawAngle = imuData.yaw;
-				continue;
-			}
-			if(standupState == StandupState_Standup && (leftTheta < -M_PI_4 || rightTheta > M_PI_4))
-				standupState = StandupState_None;
-		}
-		else
-		{
-			if(standupState == StandupState_Standup) //未达到保护条件且处于起立过程中，说明起立完成，退出起立过程
-				standupState = StandupState_None;
-		}
+        if (PROTECT_CONDITION && standupState == StandupState_None) {
+            Control_Stop();
+            Serial.println("DISARMED: body or leg angle limit");
+            continue;
+        }
+        if (standupState == StandupState_Standup &&
+            (!PROTECT_CONDITION || leftTheta < -M_PI_4 || rightTheta > M_PI_4)) {
+            standupState = StandupState_None;
+        }
+        if (!isfinite(leftJointTorque[0]) || !isfinite(leftJointTorque[1]) ||
+            !isfinite(rightJointTorque[0]) || !isfinite(rightJointTorque[1]) ||
+            !isfinite(leftWheel.torque) || !isfinite(rightWheel.torque)) {
+            Control_Stop();
+            continue;
+        }
 
 		//设定关节电机输出扭矩
 		Motor_SetTorque(&leftJoint[0], -leftJointTorque[0]);
 		Motor_SetTorque(&leftJoint[1], -leftJointTorque[1]);
 		Motor_SetTorque(&rightJoint[0], -rightJointTorque[0]);
 		Motor_SetTorque(&rightJoint[1], -rightJointTorque[1]);
+        controlReady = motorsArmed;
 
 		vTaskDelayUntil(&xLastWakeTime, 4); //4ms控制周期
 	}
@@ -717,17 +724,18 @@ void Ctrl_Init()
 	PID_SetErrLpfRatio(&legAnglePID.outer, 0.5f);
 
 	//触发各个控制任务
-	xTaskCreate(Ctrl_TargetUpdateTask, "Ctrl_TargetUpdateTask", 4096, NULL, 3, NULL);
-	xTaskCreate(LegPos_UpdateTask, "LegPos_UpdateTask", 4096, NULL, 2, NULL);
+	xTaskCreatePinnedToCore(Ctrl_TargetUpdateTask, "Ctrl_TargetUpdateTask", 4096, NULL, 3, NULL, 1);
+	xTaskCreatePinnedToCore(LegPos_UpdateTask, "LegPos_UpdateTask", 4096, NULL, 2, NULL, 1);
 	vTaskDelay(2);
-	xTaskCreate(Ctrl_Task, "Ctrl_Task", 4096, NULL, 1, NULL);
+	xTaskCreatePinnedToCore(Ctrl_Task, "Ctrl_Task", 4096, NULL, 1, NULL, 1);
 }
 
 /******* 蓝牙模块 *******/
 
 //通过蓝牙notify发送数据
-extern "C" void BT_Send(uint8_t *data, uint32_t len)
+extern "C" void BT_Send(uint8_t *data, uint16_t len)
 {
+    if (chara_tx == nullptr || server->getConnectedCount() == 0) return;
 	chara_tx->setValue(data, len);
 	chara_tx->notify();
 }
@@ -736,7 +744,7 @@ extern "C" void BT_Send(uint8_t *data, uint32_t len)
 void BT_SendSampleTask(void *arg)
 {
 	TickType_t xLastWakeTime = xTaskGetTickCount();
-	uint8_t runDuration = (*(uint8_t *)arg) * 1000;
+	uint32_t runDuration = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(arg)) * 1000u;
 	uint32_t startTime = millis();
 	while (1)
 	{
@@ -763,6 +771,7 @@ public:
 	}
 	void onDisconnect(BLEServer *server)
 	{
+        stopRequested = true;
 		Serial.println("onDisconnect");
 		server->getAdvertising()->start();
 	}
@@ -783,19 +792,24 @@ public:
 		// Serial.println();
 		// BT_Send(data, len);
 
-		if(data[0] == 0xAA && len == 4) //0xAA开头，表示目标值控制指令
+        if (len == 0) return;
+		if(data[0] == 0xAA && len == 4 && motorsArmed) //0xAA开头，表示目标值控制指令
 		{
-			target.speedCmd = (data[2] / 100.0f - 1) * 1.0f;
-			target.yawSpeedCmd = -(data[1] / 100.0f - 1) * 1.5f;
-			target.legLength = (data[3] / 200.0f) * 0.02f + 0.07f;
+            const MotionCommand command = {
+                constrain(data[2] / 100.0f - 1.0f, -1.0f, 1.0f),
+                constrain(-(data[1] / 100.0f - 1.0f) * 1.5f, -1.5f, 1.5f),
+                constrain(data[3] / 200.0f * 0.02f + 0.07f, 0.07f, 0.09f)
+            };
+            xQueueOverwrite(motionQueue, &command);
 		}
 		else if(data[0] == 0xAB) //0xAB开头，表示触发起立过程
 		{
-			xTaskCreate(Ctrl_StandupPrepareTask, "StandupPrepare_Task", 4096, NULL, 1, NULL);
+            const UserCommand command = UserCommand::Standup;
+            xQueueSend(commandQueue, &command, 0);
 		}
 		else if(data[0] == 0xAC && len == 2) //0xAC开头，表示触发一次数据采样
 		{
-			xTaskCreate(BT_SendSampleTask, "BT_SendSampleTask", 4096, &data[1], 1, NULL);
+			xTaskCreatePinnedToCore(BT_SendSampleTask, "BT_SendSampleTask", 4096, reinterpret_cast<void *>(static_cast<uintptr_t>(data[1])), 1, NULL, 1);
 		}
 		else if(data[0] == 0xDB) //0xDB开头，表示是调试指令
 		{
@@ -824,135 +838,227 @@ void BT_Init()
 //串口定时发送任务(调试用)
 void Serial_Task(void *pvParameters)
 {
-	Serial.begin(115200);
-	Serial.setTimeout(10);
-	while (1)
-	{
-		// Serial.printf("%f,%f",leftJoint[0].angle, leftJoint[1].angle);
-		// Serial.printf("%f,%f,%f,%f\r\n",leftLegPos.length, leftLegPos.angle, rightLegPos.length, rightLegPos.angle);
-		// Serial.printf("%f,%f,%f\n",imuData.yaw, imuData.pitch, imuData.roll);
-		// Serial.printf("%f,%f,%f,%f,%f,%f\r\n",leftJoint[0].angle, leftJoint[1].angle, leftWheel.angle, rightJoint[0].angle, rightJoint[1].angle, rightWheel.angle);
-		// Serial.printf("%f,%f,%f,%f,%f,%f\r\n",stateVar.theta,stateVar.dTheta,stateVar.x,stateVar.dx,stateVar.phi,stateVar.dPhi);
-		// Serial.printf("%f,%f\r\n", stateVar.theta, stateVar.dTheta);
-		// Serial.printf("%f,%f\r\n",imuData.pitch,imuData.pitchSpd);
-		// Serial.printf("%p\r\n", &speedPID.kp);
-		// Serial.printf("source voltage: %f\r\n", analogRead(0) / 4095.0f * 3.3f * 11 * 12 / 13.5f);
-		vTaskDelay(50);
-	}
+    uint32_t lastPrint = 0;
+    char command[32] = {};
+    size_t length = 0;
+    while (true) {
+        while (Serial.available()) {
+            const char value = static_cast<char>(Serial.read());
+            if (value == '\n' || value == '\r') {
+                if (length > 0) {
+                    command[length] = '\0';
+                    if (!strcmp(command, "arm")) Handle_Command(UserCommand::Arm);
+                    else if (!strcmp(command, "stop")) Handle_Command(UserCommand::Stop);
+                    else if (!strcmp(command, "stand")) Handle_Command(UserCommand::Standup);
+                    else if (!strcmp(command, "heading")) Handle_Command(UserCommand::Heading);
+                    else if (!strcmp(command, "imu-config")) Handle_Command(UserCommand::ConfigureImu);
+                    else if (!strcmp(command, "status")) Print_Status();
+                    else Serial.println("Commands: status, imu-config, arm, stop, stand, heading");
+                    length = 0;
+                }
+            } else if (length < sizeof(command) - 1) {
+                command[length++] = value;
+            } else {
+                length = 0;
+            }
+        }
+        UserCommand queued;
+        while (xQueueReceive(commandQueue, &queued, 0) == pdTRUE) Handle_Command(queued);
+        if (millis() - lastPrint >= 1000) {
+            lastPrint = millis();
+            Print_Status();
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
 //串口模块初始化
 void Serial_Init()
 {
-	xTaskCreate(Serial_Task, "Serial_Task", 4096, NULL, 1, NULL);
+	xTaskCreatePinnedToCore(Serial_Task, "Serial_Task", 4096, NULL, 1, NULL, 1);
 }
 
-/******* ADC模块 *******/
-
-//ADC定时采样任务，采样电池电压并计算电机输出比例
-void ADC_Task(void *pvParameters)
+// The PCB has power LEDs and no confirmed battery ADC input.
+void ADC_Task(void *arg)
 {
-	while (1)
-	{
-		sourceVoltage = analogRead(0) / 4095.0f * 3.3f * 11 * 12 / 13.5f;
-		if(sourceVoltage < 8)
-			sourceVoltage = 12;
-		motorOutRatio = (12 - sourceVoltage) / 10.0f + 0.7f;
-		vTaskDelay(100);
-	}
+    while (true) {
+        sourceVoltage = analogReadMilliVolts(BoardConfig::kBatteryAdc) / 1000.0f *
+                        BoardConfig::kBatteryDividerRatio;
+        if (sourceVoltage < 8.0f) Control_Stop();
+        motorOutRatio = constrain((12.0f - sourceVoltage) / 10.0f + 0.7f, 0.0f, 1.0f);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
-//ADC模块初始化
 void ADC_Init()
 {
-	xTaskCreate(ADC_Task, "ADC_Task", 4096, NULL, 5, NULL);
+    sourceVoltage = BoardConfig::kNominalVoltage;
+    motorOutRatio = 0.7f;
+    if (BoardConfig::kBatteryAdc >= 0) {
+        analogSetPinAttenuation(BoardConfig::kBatteryAdc, ADC_11db);
+        xTaskCreatePinnedToCore(ADC_Task, "ADC_Task", 2048, nullptr, 2, nullptr, 1);
+    }
 }
 
-/*******************主函数*******************/
+bool Control_FeedbackReady()
+{
+    const Jy901sSample sample = imu.snapshot();
+    const uint32_t now = millis();
+    if (!canReady || sample.configuring) return false;
+    for (size_t i = 0; i < 3; i++) {
+        if (sample.frames[i] == 0 || now - sample.receivedAt[i] > BoardConfig::kImuTimeoutMs ||
+            sample.rates[i] < BoardConfig::kMinimumImuRateHz) return false;
+    }
+    portENTER_CRITICAL(&motorMux);
+    bool ready = true;
+    const uint32_t motorNow = millis();
+    for (size_t i = 0; i < 6; i++) {
+        ready = ready && motorReceived[i] && motorNow - motorReceivedAt[i] <= BoardConfig::kFeedbackTimeoutMs;
+    }
+    portEXIT_CRITICAL(&motorMux);
+    twai_status_info_t status;
+    return ready && twai_get_status_info(&status) == ESP_OK && status.state == TWAI_STATE_RUNNING;
+}
+
+void Control_Stop()
+{
+    portENTER_CRITICAL(&motorMux);
+    motorsArmed = false;
+    controlReady = false;
+    for (Motor *motor : motorList) motor->torque = motor->voltage = 0;
+    portEXIT_CRITICAL(&motorMux);
+    standupRequested = false;
+    standupState = StandupState_None;
+    target.speedCmd = target.speed = target.yawSpeedCmd = 0;
+    if (motionQueue != nullptr) xQueueReset(motionQueue);
+}
+
+bool Control_Arm()
+{
+    if (standupTask != nullptr || digitalRead(BoardConfig::kButtonStop) == LOW) {
+        Serial.println("ARM rejected: stop button pressed or standup task is finishing");
+        return false;
+    }
+    if (!BoardConfig::kImuMountingConfirmed || !BoardConfig::kMotorCalibrationConfirmed) {
+        Serial.println("ARM rejected: confirm mounting and motor calibration in board_config.h");
+        return false;
+    }
+    if (!Control_FeedbackReady()) {
+        Serial.println("ARM rejected: need fresh six-motor feedback and >=80Hz IMU data");
+        return false;
+    }
+    if (motorsArmed) return true;
+    for (CascadePID *pid : {&yawPID, &rollPID, &legLengthPID, &legAnglePID}) {
+        PID_Clear(&pid->inner);
+        PID_Clear(&pid->outer);
+    }
+    target.position = (leftWheel.angle + rightWheel.angle) / 2 * 0.026f;
+    target.yawAngle = imu.snapshot().yaw;
+    portENTER_CRITICAL(&motorMux);
+    for (Motor *motor : motorList) motor->torque = motor->voltage = 0;
+    controlReady = false;
+    motorsArmed = true;
+    portEXIT_CRITICAL(&motorMux);
+    Serial.println("ARMED");
+    return true;
+}
+
+void Handle_Command(UserCommand command)
+{
+    switch (command) {
+        case UserCommand::Arm: Control_Arm(); break;
+        case UserCommand::Stop: Control_Stop(); Serial.println("DISARMED"); break;
+        case UserCommand::Standup:
+            if (motorsArmed && standupState == StandupState_None && standupTask == nullptr) standupRequested = true;
+            break;
+        case UserCommand::Heading: target.yawAngle = imu.snapshot().yaw; break;
+        case UserCommand::ConfigureImu:
+            Control_Stop();
+            imu.requestConfiguration();
+            break;
+    }
+}
+
+void Print_Status()
+{
+    const Jy901sSample sample = imu.snapshot();
+    Serial.printf("%s IMU baud=%lu Hz=%.1f/%.1f/%.1f RPY(deg)=%.2f,%.2f,%.2f gyro(rad/s)=%.3f,%.3f,%.3f az=%.3f crc=%lu\n",
+                  motorsArmed ? "ARMED" : "DISARMED", static_cast<unsigned long>(sample.baud),
+                  sample.rates[0], sample.rates[1], sample.rates[2],
+                  sample.roll * 180 / PI, sample.pitch * 180 / PI, sample.yaw * 180 / PI,
+                  sample.rollSpeed, sample.pitchSpeed, sample.yawSpeed, sample.zAcceleration,
+                  static_cast<unsigned long>(sample.checksumErrors));
+    const uint32_t now = millis();
+    portENTER_CRITICAL(&motorMux);
+    uint32_t timestamps[6];
+    bool seen[6];
+    float angles[6];
+    memcpy(timestamps, motorReceivedAt, sizeof(timestamps));
+    memcpy(seen, motorReceived, sizeof(seen));
+    for (size_t i = 0; i < 6; i++) angles[i] = motorList[i]->angle;
+    portEXIT_CRITICAL(&motorMux);
+    for (size_t i = 0; i < 6; i++) {
+        Serial.printf(" ID%u=%s angle=%.3f age=%lums", BoardConfig::kMotorIds[i],
+                      seen[i] && now - timestamps[i] <= BoardConfig::kFeedbackTimeoutMs ? "online" : "offline",
+                      angles[i], static_cast<unsigned long>(now - timestamps[i]));
+    }
+    twai_status_info_t status = {};
+    if (canReady && twai_get_status_info(&status) == ESP_OK) {
+        Serial.printf(" CAN state=%d TEC=%lu REC=%lu rxMiss=%lu txFail=%lu", status.state,
+                      static_cast<unsigned long>(status.tx_error_counter),
+                      static_cast<unsigned long>(status.rx_error_counter),
+                      static_cast<unsigned long>(status.rx_missed_count),
+                      static_cast<unsigned long>(status.tx_failed_count));
+    }
+    Serial.println();
+    Serial.printf("CAN rx=%lu txQueueDrops=%lu Vbat=%.2f%s\n",
+                  static_cast<unsigned long>(canRxFrames), static_cast<unsigned long>(canTxErrors),
+                  sourceVoltage, BoardConfig::kBatteryAdc < 0 ? " (nominal)" : "");
+}
 
 void setup()
 {
-	pinMode(9, INPUT_PULLUP); //按钮引脚
-	pinMode(10, OUTPUT); //LED引脚
-
-	//上电后等待5s
-	digitalWrite(10, HIGH);
-	vTaskDelay(5000);
-	digitalWrite(10, LOW);
-
-	//初始化所有模块
-	Serial_Init();
-	ADC_Init();
-	CAN_Init();
-	IMU_Init();
-	Motor_InitAll();
-	Ctrl_Init();
-	BT_Init();
+    Serial.begin(115200);
+    const uint32_t startedAt = millis();
+    while (!Serial && millis() - startedAt < 3000) delay(10);
+    Serial.println("ESP32-S3 wheel-legged controller; boot DISARMED");
+    pinMode(BoardConfig::kButtonCenter, INPUT_PULLUP);
+    pinMode(BoardConfig::kButtonStop, INPUT_PULLUP);
+    commandQueue = xQueueCreate(8, sizeof(UserCommand));
+    motionQueue = xQueueCreate(1, sizeof(MotionCommand));
+    if (commandQueue == nullptr || motionQueue == nullptr) {
+        Serial.println("Command queue allocation failed");
+        while (true) delay(1000);
+    }
+    for (size_t i = 0; i < 6; i++) {
+        if (BoardConfig::kMotorIds[i] < 1 || BoardConfig::kMotorIds[i] > 8) {
+            Serial.println("Invalid motor ID; expected 1..8");
+            while (true) delay(1000);
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (BoardConfig::kMotorIds[i] == BoardConfig::kMotorIds[j]) {
+                Serial.println("Duplicate configured motor IDs");
+                while (true) delay(1000);
+            }
+        }
+    }
+    Motor_InitAll();
+    ADC_Init();
+    CAN_Init();
+    IMU_Init();
+    Ctrl_Init();
+    BT_Init();
+    Serial_Init();
+    xTaskCreatePinnedToCore(Motor_SendTask, "Motor_SendTask", 4096, nullptr, 5, nullptr, 1);
+    Serial.println("Commands (newline): status, imu-config, arm, stop, stand, heading");
 }
 
 void loop()
 {
-	//LED闪烁次数表示电池电压
-	for(int i = 0; i < (sourceVoltage - 11) / 0.5f + 1; i++)
-	{
-		digitalWrite(10, HIGH);
-		vTaskDelay(100);
-		digitalWrite(10, LOW);
-		vTaskDelay(200);
-	}
-	digitalWrite(10, HIGH);
-	vTaskDelay(100);
-	digitalWrite(10, LOW);
-	vTaskDelay(600);
-
-	//检测到按钮按下，根据按下时长执行不同的操作
-	if(digitalRead(9) == LOW)
-	{
-		int cmdCnt = 0;
-		vTaskDelay(2000);
-		while(digitalRead(9) == LOW) //等待按钮松开，闪烁LED并计算按下时长
-		{
-			cmdCnt++;
-			digitalWrite(10, HIGH);
-			vTaskDelay(300);
-			digitalWrite(10, LOW);
-			vTaskDelay(500);
-		}
-		vTaskDelay(2000);
-
-		if(cmdCnt == 1) //功能1：设定目标航向角为当前值
-		{
-			target.yawAngle = imuData.yaw;
-		}
-		else if(cmdCnt == 2) //功能2：进入起立过程
-		{
-			xTaskCreate(Ctrl_StandupPrepareTask, "StandupPrepare_Task", 4096, NULL, 1, NULL);
-		}
-		else if(cmdCnt == 3) //功能3：向前运动2s
-		{
-			target.speedCmd = 1.0f;
-			vTaskDelay(2000);
-			target.speedCmd = 0.0f;
-		}
-		else if(cmdCnt == 4) //功能4：向前运动5s
-		{
-			target.speedCmd = 1.0f;
-			vTaskDelay(5000);
-			target.speedCmd = 0.0f;
-		}
-		else if(cmdCnt == 5) //功能5：旋转90°
-		{
-			target.yawAngle += M_PI;
-		}
-	}
-}
-
-//真正的入口函数，调用setup和loop，模仿Arduino结构
-extern "C" void app_main()
-{
-	setup();
-	while (1)
-	{
-		loop();
-	}
+    if (digitalRead(BoardConfig::kButtonStop) == LOW) Control_Stop();
+    static bool centerWasPressed = false;
+    const bool centerPressed = digitalRead(BoardConfig::kButtonCenter) == LOW;
+    if (centerPressed && !centerWasPressed) Handle_Command(UserCommand::Heading);
+    centerWasPressed = centerPressed;
+    delay(20);
 }
